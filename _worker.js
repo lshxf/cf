@@ -6,8 +6,8 @@ import { connect } from 'cloudflare:sockets';
 // [Windows] Press "Win + R", input cmd and run:  Powershell -NoExit -Command "[guid]::NewGuid()"
 let userID = 'eeccaa38-3869-41bd-bf62-177f3ae14fab';
 
-let proxyIP = '112.213.105.238';
-
+let proxyIP = 'cdn.anycast.eu.org';
+// 112.213.105.238
 let dohURL = 'https://dns.google/dns-query'; // https://cloudflare-dns.com/dns-query or https://dns.google/dns-query
 
 // v2board api environment variables
