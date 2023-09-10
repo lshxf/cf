@@ -6,8 +6,10 @@ import { connect } from 'cloudflare:sockets';
 // [Windows] Press "Win + R", input cmd and run:  Powershell -NoExit -Command "[guid]::NewGuid()"
 let userID = 'eeccaa38-3869-41bd-bf62-177f3ae14fab';
 
-let proxyIP = '8.210.117.18';
-let dohURL = 'https://dns.google/dns-query'; // https://cloudflare-dns.com/dns-query or https://dns.google/dns-query
+const proxyIPs = ['8.210.117.18']; // ['cdn-all.xn--b6gac.eu.org', 'cdn.xn--b6gac.eu.org', 'cdn-b100.xn--b6gac.eu.org', 'edgetunnel.anycast.eu.org', 'cdn.anycast.eu.org'];
+let proxyIP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+
+let dohURL = 'https://sky.rethinkdns.com/1:-Pf_____9_8A_AMAIgE8kMABVDDmKOHTAKg='; // https://cloudflare-dns.com/dns-query or https://dns.google/dns-query
 
 // v2board api environment variables
 let nodeId = ''; // 1
@@ -39,8 +41,54 @@ export default {
 			if (!upgradeHeader || upgradeHeader !== 'websocket') {
 				const url = new URL(request.url);
 				switch (url.pathname) {
-					case '/':
-						return new Response(JSON.stringify(request.cf), { status: 200 });
+					case '/cf':
+						return new Response(JSON.stringify(request.cf, null, 4), {
+							status: 200,
+							headers: {
+								"Content-Type": "application/json;charset=utf-8",
+							},
+						});
+					case '/connect': // for test connect to cf socket
+						const [hostname, port] = ['cloudflare.com', '80'];
+						console.log(`Connecting to ${hostname}:${port}...`);
+
+						try {
+							const socket = await connect({
+								hostname: hostname,
+								port: parseInt(port, 10),
+							});
+
+							const writer = socket.writable.getWriter();
+
+							try {
+								await writer.write(new TextEncoder().encode('GET / HTTP/1.1\r\nHost: ' + hostname + '\r\n\r\n'));
+							} catch (writeError) {
+								writer.releaseLock();
+								await socket.close();
+								return new Response(writeError.message, { status: 500 });
+							}
+
+							writer.releaseLock();
+
+							const reader = socket.readable.getReader();
+							let value;
+
+							try {
+								const result = await reader.read();
+								value = result.value;
+							} catch (readError) {
+								await reader.releaseLock();
+								await socket.close();
+								return new Response(readError.message, { status: 500 });
+							}
+
+							await reader.releaseLock();
+							await socket.close();
+
+							return new Response(new TextDecoder().decode(value), { status: 200 });
+						} catch (connectError) {
+							return new Response(connectError.message, { status: 500 });
+						}
 					case `/${userID}`: {
 						const vlessConfig = getVLESSConfig(userID, request.headers.get('Host'));
 						return new Response(`${vlessConfig}`, {
@@ -51,7 +99,12 @@ export default {
 						});
 					}
 					default:
-						return new Response('Not found', { status: 404 });
+						// return new Response('Not found', { status: 404 });
+						// For any other path, reverse proxy to 'www.fmprc.gov.cn' and return the original response
+						url.hostname = 'global.cctv.com';
+						url.protocol = 'https:';
+						request = new Request(url, request);
+						return await fetch(request);
 				}
 			} else {
 				return await vlessOverWSHandler(request);
@@ -111,12 +164,12 @@ async function vlessOverWSHandler(request) {
 			const {
 				hasError,
 				message,
-				portRemote = 443,
+				portRemote = [443, 8443, 2053, 2083, 2087, 2096, 80, 8080, 8880, 2052, 2082, 2086, 2095],
 				addressRemote = '',
 				rawDataIndex,
 				vlessVersion = new Uint8Array([0, 0]),
 				isUDP,
-			} = processVlessHeader(chunk, userID);
+			} = await processVlessHeader(chunk, userID);
 			address = addressRemote;
 			portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '
 				} `;
@@ -168,6 +221,11 @@ async function vlessOverWSHandler(request) {
 
 let apiResponseCache = null;
 let cacheTimeout = null;
+
+/**
+ * Fetches the API response from the server and caches it for future use.
+ * @returns {Promise<object|null>} A Promise that resolves to the API response object or null if there was an error.
+ */
 async function fetchApiResponse() {
 	const requestOptions = {
 		method: 'GET',
@@ -197,6 +255,10 @@ async function fetchApiResponse() {
 	}
 }
 
+/**
+ * Returns the cached API response if it exists, otherwise fetches the API response from the server and caches it for future use.
+ * @returns {Promise<object|null>} A Promise that resolves to the cached API response object or the fetched API response object, or null if there was an error.
+ */
 async function getApiResponse() {
 	if (!apiResponseCache) {
 		return await fetchApiResponse();
@@ -204,10 +266,15 @@ async function getApiResponse() {
 	return apiResponseCache;
 }
 
+/**
+ * Checks if a given UUID is present in the API response.
+ * @param {string} targetUuid The UUID to search for.
+ * @returns {Promise<boolean>} A Promise that resolves to true if the UUID is present in the API response, false otherwise.
+ */
 async function checkUuidInApiResponse(targetUuid) {
 	// Check if any of the environment variables are empty
 	if (!nodeId || !apiToken || !apiHost) {
-		return true;
+		return false;
 	}
 
 	try {
@@ -348,7 +415,7 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
  * @param {string} userID 
  * @returns 
  */
-function processVlessHeader(
+async function processVlessHeader(
 	vlessBuffer,
 	userID
 ) {
@@ -361,9 +428,16 @@ function processVlessHeader(
 	const version = new Uint8Array(vlessBuffer.slice(0, 1));
 	let isValidUser = false;
 	let isUDP = false;
-	if (stringify(new Uint8Array(vlessBuffer.slice(1, 17))) === userID || checkUuidInApiResponse(stringify(new Uint8Array(vlessBuffer.slice(1, 17))))) {
-		isValidUser = true;
-	}
+	const slicedBuffer = new Uint8Array(vlessBuffer.slice(1, 17));
+	const slicedBufferString = stringify(slicedBuffer);
+
+	const uuids = userID.includes(',') ? userID.split(",") : [userID];
+
+	const checkUuidInApi = await checkUuidInApiResponse(slicedBufferString);
+	isValidUser = uuids.some(userUuid => checkUuidInApi || slicedBufferString === userUuid.trim());
+
+	console.log(`checkUuidInApi: ${await checkUuidInApiResponse(slicedBufferString)}, userID: ${slicedBufferString}`);
+
 	if (!isValidUser) {
 		return {
 			hasError: true,
@@ -672,31 +746,106 @@ async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
  * @returns {string}
  */
 function getVLESSConfig(userID, hostName) {
-	const vlessMain = `vless://${userID}@${hostName}:443?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`
-	return `
+  const wvlessws = `vless://${userID}@skk.moe:8880?encryption=none&security=none&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`;
+  const pvlesswstls = `vless://${userID}@skk.moe:8443?encryption=none&security=tls&type=ws&host=${hostName}&sni=${hostName}&fp=random&path=%2F%3Fed%3D2048#${hostName}`;
+  
+  if (hostName.includes('pages.dev')) {
+    return `
+==========================配置详解==============================
+
 ################################################################
-v2ray
+CF-pages-vless+ws+tls节点，分享链接如下：
+
+${pvlesswstls}
+
 ---------------------------------------------------------------
-${vlessMain}
+注意：如果 ${hostName} 在本地网络打不开（中国移动用户注意）
+       客户端选项的伪装域名(host)必须改为你在CF解析完成的自定义域名
 ---------------------------------------------------------------
-################################################################
-clash-meta
----------------------------------------------------------------
-- type: vless
-  name: ${hostName}
-  server: ${hostName}
-  port: 443
-  uuid: ${userID}
-  network: ws
-  tls: true
-  udp: false
-  sni: ${hostName}
-  client-fingerprint: chrome
-  ws-opts:
-    path: "/?ed=2048"
-    headers:
-      host: ${hostName}
----------------------------------------------------------------
+客户端必要文明参数如下：
+客户端地址(address)：自定义的域名 或者 优选域名 或者 优选IP
+端口(port)：6个https端口可任意选择(443、8443、2053、2083、2087、2096)
+用户ID(uuid)：${userID}
+传输协议(network)：ws 或者 websocket
+伪装域名(host)：${hostName}
+路径(path)：/?ed=2048
+传输安全(TLS)：开启
+跳过证书验证(allowlnsecure)：false
 ################################################################
 `;
+
+  } else if (hostName.includes('workers.dev'))  {
+    return `
+==========================配置详解==============================
+
+################################################################
+一、CF-workers-vless+ws节点，分享链接如下：
+
+${wvlessws}
+
+---------------------------------------------------------------
+注意：当前节点无需使用CF解析完成的域名，客户端选项的TLS选项必须关闭
+---------------------------------------------------------------
+客户端必要文明参数如下：
+客户端地址(address)：自定义的域名 或者 优选域名 或者 优选IP
+端口(port)：7个http端口可任意选择(80、8080、8880、2052、2082、2086、2095)
+用户ID(uuid)：${userID}
+传输协议(network)：ws 或者 websocket
+伪装域名(host)：${hostName}
+路径(path)：/?ed=2048
+################################################################
+
+
+################################################################
+
+查看CF-workers-vless+ws+tls节点配置信息，请在浏览器地址栏输入：自定义域名/UUID
+必须设置自定义域名后才能使用Workers方式的TLS模式，否则，建议只使用vless+ws节点即可
+提示：使用pages方式部署，联通、电信用户大概率可以直接使用TLS模式，无需设置自定义域名
+pages方式部署可参考此视频教程：https://youtu.be/McdRoLZeTqg
+
+################################################################
+`;
+  } else {
+    return `
+==========================配置详解==============================
+
+=====使用自定义域名查看配置，请确认使用的是workers还是pages=====
+
+################################################################
+一、CF-workers-vless+ws节点，分享链接如下：
+
+${wvlessws}
+
+---------------------------------------------------------------
+注意：当前节点无需使用CF解析完成的域名，客户端选项的TLS选项必须关闭
+---------------------------------------------------------------
+客户端必要文明参数如下：
+客户端地址(address)：自定义的域名 或者 优选域名 或者 优选IP
+端口(port)：7个http端口可任意选择(80、8080、8880、2052、2082、2086、2095)
+用户ID(uuid)：${userID}
+传输协议(network)：ws 或者 websocket
+伪装域名(host)：${hostName}
+路径(path)：/?ed=2048
+################################################################
+
+################################################################
+二、CF-workers-vless+ws+tls 或者 CF-pages-vless+ws+tls节点，分享链接如下：
+
+${pvlesswstls}
+
+---------------------------------------------------------------
+注意：客户端选项的伪装域名(host)必须改为你在CF解析完成的自定义域名
+---------------------------------------------------------------
+客户端必要文明参数如下：
+客户端地址(address)：自定义的域名 或者 优选域名 或者 优选IP
+端口(port)：6个https端口可任意选择(443、8443、2053、2083、2087、2096)
+用户ID(uuid)：${userID}
+传输协议(network)：ws 或者 websocket
+伪装域名(host)：${hostName}
+路径(path)：/?ed=2048
+传输安全(TLS)：开启
+跳过证书验证(allowlnsecure)：false
+################################################################
+`;
+  }
 }
